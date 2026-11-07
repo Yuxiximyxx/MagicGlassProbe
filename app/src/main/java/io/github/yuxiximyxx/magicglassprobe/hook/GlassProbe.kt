@@ -64,29 +64,54 @@ object GlassProbe {
     private fun runStages(act: Activity) {
         val decor = act.window?.decorView ?: return
         val density = act.resources.displayMetrics.density
+        // 阶段 1：HnMaterialManager 官方入口（v0.2 的 B，已证可见效）
+        applyToBar(act, density, "阶段1") { cl, bar ->
+            stageB(act, cl, bar, density)
+        }
+        // 阶段 2：裸调 View.setHnMaterial + MaterialOpt 标志（v0.2 的 C，已证可见效）
+        decor.postDelayed({
+            applyToBar(act, density, "阶段2") { cl, bar ->
+                stageC(act, cl, bar, density)
+            }
+        }, 5000)
+        // 阶段 3：系统磨砂 Drawable 兜底（v0.2 的 D，已证可见效）
+        decor.postDelayed({
+            applyToBar(act, density, "阶段3") { cl, bar ->
+                stageD(act, cl, bar)
+            }
+        }, 10000)
+    }
+
+    /** 每个阶段都重新找一次底栏（几何会稳定下来），且校验命中的是真底栏。 */
+    private fun applyToBar(
+        act: Activity,
+        density: Float,
+        label: String,
+        block: (ClassLoader, View) -> Unit
+    ) {
+        val decor = act.window?.decorView ?: return
         val bar = findBottomBar(decor, density)
         if (bar == null) {
-            log("未找到底栏候选，本轮跳过（界面可能还没布局完）")
+            log("$label 未找到合格底栏候选，跳过")
             return
         }
         val idName = runCatching { act.resources.getResourceEntryName(bar.id) }.getOrNull()
-        log("底栏命中: ${bar.javaClass.name} id=$idName size=${bar.width}x${bar.height}")
-        val cl = act.classLoader
+        log("$label 底栏命中: ${bar.javaClass.name} id=$idName size=${bar.width}x${bar.height} 祖先链=${ancestorChain(bar)}")
+        runCatching { block(act.classLoader, bar) }
+            .onFailure { log("$label 执行异常（已吞）", it) }
+    }
 
-        // 阶段 A：裸调 View.setHnMaterial
-        stageA(act, cl, bar, density)
-        // 阶段 B：HnMaterialManager 官方入口
-        decor.postDelayed({
-            runCatching { stageB(act, cl, bar, density) }
-        }, 4000)
-        // 阶段 C：带 MaterialOpt 标志
-        decor.postDelayed({
-            runCatching { stageC(act, cl, bar, density) }
-        }, 8000)
-        // 阶段 D：系统模糊 Drawable 兜底
-        decor.postDelayed({
-            runCatching { stageD(act, cl, bar) }
-        }, 12000)
+    private fun ancestorChain(v: View): String {
+        val sb = StringBuilder()
+        var p: View? = v.parent as? View
+        var n = 0
+        while (p != null && n < 8) {
+            if (n > 0) sb.append(" < ")
+            sb.append(p.javaClass.simpleName)
+            p = p.parent as? View
+            n++
+        }
+        return sb.toString()
     }
 
     // ---------------- 阶段实现 ----------------
@@ -162,7 +187,7 @@ object GlassProbe {
     }
 
     private fun stageB(act: Activity, cl: ClassLoader, bar: View, density: Float) {
-        log("=== 阶段 B：HnMaterialManager.setHnMaterial(View,...) ===")
+        log("=== 阶段 1：HnMaterialManager.setHnMaterial(View,...) ===")
         val material = buildMaterial(cl, bar.width, bar.height, 20f * density) ?: return
         val opt = newOpt(cl) ?: return
         val clsMgr = loadClass(cl, "com.hihonor.android.graphics.material.HnMaterialManager") ?: return
@@ -172,11 +197,11 @@ object GlassProbe {
             clsMgr.getMethod("setHnMaterial", View::class.java, clsMaterial, clsOpt)
                 .invoke(null, bar, material, opt)
         }
-        toast(act, "阶段B 已应用：Manager 液态材质")
+        toast(act, "阶段1 已应用：Manager 液态材质")
     }
 
     private fun stageC(act: Activity, cl: ClassLoader, bar: View, density: Float) {
-        log("=== 阶段 C：View.setHnMaterial + MaterialOpt 标志 ===")
+        log("=== 阶段 2：View.setHnMaterial + MaterialOpt 标志 ===")
         val material = buildMaterial(cl, bar.width, bar.height, 20f * density) ?: return
         val liquid = step("material.toLiquidGlassMaterial()") {
             material.javaClass.getMethod("toLiquidGlassMaterial").invoke(material)
@@ -199,11 +224,11 @@ object GlassProbe {
             )
             m.invoke(bar, arr, materialOpt)
         }
-        toast(act, "阶段C 已应用：材质+backdrop 标志")
+        toast(act, "阶段2 已应用：材质+backdrop 标志")
     }
 
     private fun stageD(act: Activity, cl: ClassLoader, bar: View) {
-        log("=== 阶段 D：HnBackgroundBlurDrawable 兜底磨砂 ===")
+        log("=== 阶段 3：HnBackgroundBlurDrawable 兜底磨砂 ===")
         val clsD = loadClass(cl, "com.hihonor.android.graphics.drawable.HnBackgroundBlurDrawable") ?: return
         val d = step("new HnBackgroundBlurDrawable") { newInstance(clsD) } ?: return
         step("drawable.createBlurDrawable(bar)") {
@@ -219,7 +244,7 @@ object GlassProbe {
         step("drawable.setBackgroundBlur(bar)") {
             clsD.getMethod("setBackgroundBlur", View::class.java).invoke(d, bar)
         }
-        toast(act, "阶段D 已应用：系统模糊背景")
+        toast(act, "阶段3 已应用：系统模糊背景")
     }
 
     // ---------------- 找底栏（与 v0.1 相同口径） ----------------
@@ -235,7 +260,8 @@ object GlassProbe {
             val (v, depth) = stack.removeLast()
             if (v.visibility == View.VISIBLE &&
                 v.width >= decor.width * 0.85 &&
-                v.height >= minH && v.height <= maxH
+                v.height >= minH && v.height <= maxH &&
+                !insideScrollingContainer(v)
             ) {
                 val loc = IntArray(2)
                 v.getLocationInWindow(loc)
@@ -253,6 +279,20 @@ object GlassProbe {
             }
         }
         return best
+    }
+
+    /** v0.2 教训：聊天列表 item 会垫在底栏下面且几何一模一样，命中它效果会被
+     *  RecyclerView 回收带到别的行上。底栏绝不会在滚动容器里面，先排除。 */
+    private fun insideScrollingContainer(v: View): Boolean {
+        var p: View? = v.parent as? View
+        while (p != null) {
+            val n = p.javaClass.name
+            if (n.contains("ListView") || n.contains("RecyclerView") ||
+                n.contains("AbsListView") || n.contains("ScrollView")
+            ) return true
+            p = p.parent as? View
+        }
+        return false
     }
 
     // ---------------- 反射小工具 ----------------

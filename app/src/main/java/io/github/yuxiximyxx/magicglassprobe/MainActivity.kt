@@ -11,7 +11,7 @@ class MainActivity : Activity() {
         super.onCreate(savedInstanceState)
         val tv = TextView(this).apply {
             text = """
-                MagicGlass 探针 v0.2.0
+                MagicGlass 探针 v0.3.0
 
                 验证目标：第三方应用进程能不能直接调用 MagicOS
                 framework 的窗口级液态玻璃 API
