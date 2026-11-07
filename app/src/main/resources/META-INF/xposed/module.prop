@@ -1,0 +1,6 @@
+name=MagicGlassProbe
+description=最小验证模块：对微信底栏调用 MagicOS framework 的窗口级液态玻璃 API（HnLiquidGlassWindowManger），验证第三方进程能否用上系统液态玻璃
+minApiVersion=102
+targetApiVersion=102
+staticScope=true
+autoHotReload=false
