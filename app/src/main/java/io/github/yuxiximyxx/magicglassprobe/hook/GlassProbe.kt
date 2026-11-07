@@ -7,29 +7,28 @@ import android.view.View
 import android.view.ViewGroup
 import android.widget.Toast
 import io.github.libxposed.api.XposedModule
+import java.lang.reflect.Array as ReflectArray
 import java.lang.reflect.InvocationTargetException
 import java.util.Collections
 import java.util.WeakHashMap
 
 /**
- * GlassProbe —— 最小验证探针。
+ * GlassProbe v0.2 —— 分阶段验证「视图级材质」路线。
  *
- * 目的只有一个：验证「第三方应用进程能否调用 MagicOS framework-magic.jar
- * 里的窗口级液态玻璃 API（HnLiquidGlassWindowManger），让系统替应用渲染
- * 底栏玻璃」。方法面来自对真机 framework-magic.jar 的 dexdump 提取：
+ * v0.1 结论（真机日志实证）：窗口级 HnLiquidGlassWindowManger 调用链全部走通、
+ * SurfaceControl 有效、事务 apply 无异常，但画面无变化 —— 该路径服务的是
+ * 独立玻璃窗口（控制中心那类），对普通应用窗口不渲染。
  *
- *   HnLiquidGlassWindowManger
- *     getSurfaceControl(View) : SurfaceControl   ← 实现是 view.getViewRootImpl().getSurfaceControl()，即窗口级
- *     setBlurEnableForView(View, boolean)        ← 转调 View.setBlurEnableForView（荣耀给 View 加的方法）
- *     setWindowBlurParams(SurfaceControl, BlurParamEx)
- *     setWindowLiquidGlassEnable(SurfaceControl, boolean, HnLiquidGlassMaterial)
+ * framework 里真正的应用内入口（dexdump 实证）：
+ *   android.view.View.setHnMaterial(Material[], MaterialOpt)
+ *   com.hihonor.android.graphics.material.HnMaterialManager.setHnMaterial(View, HnMaterial, HnMaterialOpt)
+ * 材质挂到 View / RenderNode 上，由应用自己的 RenderThread 采样窗内背景渲染。
  *
- *   材质 = HnLiquidGlassMaterial（setBlurParamEx + setGlassParamEx + setShapeParamEx）
- *   形状 = ShapeParamEx(Shape.RRect) + setRect(窗口坐标) + setRadius —— 玻璃只在形状区域内生效，
- *   所以「窗口级」不等于「整窗变玻璃」：区域由形状圈定，这正是它能给底栏用的原因。
- *
- * 每一步独立记日志（LSPosed 日志搜 MagicGlassProbe），失败不抛、不用重试轰炸：
- * 第 1 次未完全成功时 2 秒后只重试 1 次（等 SurfaceControl 就绪）。
+ * 本版在同一个底栏上按时间顺序跑四个阶段（每阶段 Toast 编号），一次安装测完：
+ *   A 视图材质（裸调 View.setHnMaterial，形状用视图本地坐标）
+ *   B 视图材质（走 HnMaterialManager 官方静态入口）
+ *   C 视图材质 + MaterialOpt 标志（setLayerBackdrop / setClearBackground）
+ *   D 兜底：HnBackgroundBlurDrawable 挂作底栏背景（系统磨砂，非液态）
  */
 object GlassProbe {
 
@@ -37,7 +36,6 @@ object GlassProbe {
 
     private lateinit var module: XposedModule
 
-    /** 已排过探针的 Activity 实例（弱引用集合，防重复应用）。 */
     private val scheduled = Collections.newSetFromMap(WeakHashMap<Activity, Boolean>())
 
     fun install(module: XposedModule, classLoader: ClassLoader) {
@@ -54,57 +52,178 @@ object GlassProbe {
             }.onFailure { log("onResume 后处理异常（已吞）", it) }
             result
         }
-        log("Activity.onResume hook 已安装")
+        log("Activity.onResume hook 已安装（v0.2 分阶段）")
     }
 
     private fun schedule(act: Activity) {
         if (!scheduled.add(act)) return
         val decor = act.window?.decorView ?: return
-        decor.postDelayed({ apply(act, attempt = 1) }, 900)
+        decor.postDelayed({ runStages(act) }, 900)
     }
 
-    private fun apply(act: Activity, attempt: Int) {
+    private fun runStages(act: Activity) {
         val decor = act.window?.decorView ?: return
         val density = act.resources.displayMetrics.density
-
-        val found = findBottomBar(decor, density)
-        val target: View
-        val rect: RectF
-        val radiusPx: Float
-        if (found != null) {
-            target = found
-            val loc = IntArray(2)
-            found.getLocationInWindow(loc)
-            rect = RectF(
-                loc[0].toFloat(), loc[1].toFloat(),
-                (loc[0] + found.width).toFloat(), (loc[1] + found.height).toFloat()
-            )
-            radiusPx = 20f * density
-            val idName = runCatching { act.resources.getResourceEntryName(found.id) }.getOrNull()
-            log("底栏命中: ${found.javaClass.name} id=$idName rect=$rect radius=$radiusPx")
-        } else {
-            target = decor
-            val h = 64f * density
-            rect = RectF(0f, decor.height - h, decor.width.toFloat(), decor.height.toFloat())
-            radiusPx = 0f
-            log("未找到底栏候选，退回装饰视图底部条带 rect=$rect")
+        val bar = findBottomBar(decor, density)
+        if (bar == null) {
+            log("未找到底栏候选，本轮跳过（界面可能还没布局完）")
+            return
         }
+        val idName = runCatching { act.resources.getResourceEntryName(bar.id) }.getOrNull()
+        log("底栏命中: ${bar.javaClass.name} id=$idName size=${bar.width}x${bar.height}")
+        val cl = act.classLoader
 
-        val ok = runGlass(act.classLoader, target, rect, radiusPx)
-        if (ok) {
-            log("PROBE DONE —— 系统液态玻璃调用链全部走通，看微信底栏是否变化")
-            runCatching {
-                Toast.makeText(act, "MagicGlass 探针已应用，看底栏", Toast.LENGTH_LONG).show()
-            }
-        } else if (attempt == 1) {
-            log("第 1 次未走通，2 秒后重试一次")
-            decor.postDelayed({ apply(act, attempt = 2) }, 2000)
-        } else {
-            log("PROBE FAILED —— 两次都没走通，看上面每步的 FAIL 行定位卡点")
-        }
+        // 阶段 A：裸调 View.setHnMaterial
+        stageA(act, cl, bar, density)
+        // 阶段 B：HnMaterialManager 官方入口
+        decor.postDelayed({
+            runCatching { stageB(act, cl, bar, density) }
+        }, 4000)
+        // 阶段 C：带 MaterialOpt 标志
+        decor.postDelayed({
+            runCatching { stageC(act, cl, bar, density) }
+        }, 8000)
+        // 阶段 D：系统模糊 Drawable 兜底
+        decor.postDelayed({
+            runCatching { stageD(act, cl, bar) }
+        }, 12000)
     }
 
-    /** 在视图树里找「贴底、全宽、高 36~110dp」的候选，取层级最深的一个（通常就是底栏容器）。 */
+    // ---------------- 阶段实现 ----------------
+
+    /** 组装一份液态材质；shapeRect 用视图本地坐标（视图级路径）。 */
+    private fun buildMaterial(cl: ClassLoader, w: Int, h: Int, radiusPx: Float): Any? {
+        val clsMaterial = loadClass(cl, "com.hihonor.android.graphics.material.HnLiquidGlassMaterial") ?: return null
+        val clsBlur = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.BlurParamEx") ?: return null
+        val clsGlass = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.GlassParamEx") ?: return null
+        val clsShape = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.ShapeParamEx") ?: return null
+        val clsShapeEnum = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.ShapeParamEx\$Shape") ?: return null
+
+        val blur = step("new BlurParamEx") { newInstance(clsBlur) } ?: return null
+        step("blur.setRadius(48)") { clsBlur.getMethod("setRadius", F).invoke(blur, 48f) }
+        step("blur.setScale(0.3)") { clsBlur.getMethod("setScale", F).invoke(blur, 0.3f) }
+        step("blur.setSaturation(1.35)") { clsBlur.getMethod("setSaturation", F).invoke(blur, 1.35f) }
+
+        val glass = step("new GlassParamEx") { newInstance(clsGlass) } ?: return null
+        step("glass.setRefraction(1.0)") { clsGlass.getMethod("setRefraction", F).invoke(glass, 1.0f) }
+        step("glass.setThickness(1.4)") { clsGlass.getMethod("setThickness", F).invoke(glass, 1.4f) }
+        step("glass.setDepth(0.5)") { clsGlass.getMethod("setDepth", F).invoke(glass, 0.5f) }
+        step("glass.setDispersion(0.25)") { clsGlass.getMethod("setDispersion", F).invoke(glass, 0.25f) }
+
+        val shape = step("new ShapeParamEx(RRect)") {
+            val rrect = clsShapeEnum.enumConstants?.firstOrNull { it.toString() == "RRect" }
+                ?: throw IllegalStateException("Shape.RRect 不存在")
+            clsShape.getConstructor(clsShapeEnum).newInstance(rrect)
+        } ?: return null
+        val rect = RectF(0f, 0f, w.toFloat(), h.toFloat())
+        step("shape.setRect(local $rect)") { clsShape.getMethod("setRect", RectF::class.java).invoke(shape, rect) }
+        step("shape.setRadius($radiusPx)") { clsShape.getMethod("setRadius", F).invoke(shape, radiusPx) }
+
+        val material = step("new HnLiquidGlassMaterial") { newInstance(clsMaterial) } ?: return null
+        step("material.setBlurParamEx") { clsMaterial.getMethod("setBlurParamEx", clsBlur).invoke(material, blur) }
+        step("material.setGlassParamEx") { clsMaterial.getMethod("setGlassParamEx", clsGlass).invoke(material, glass) }
+        step("material.setShapeParamEx") { clsMaterial.getMethod("setShapeParamEx", clsShape).invoke(material, shape) }
+        return material
+    }
+
+    private fun newOpt(cl: ClassLoader): Any? {
+        val clsOpt = loadClass(cl, "com.hihonor.android.graphics.material.HnMaterialOpt") ?: return null
+        return step("new HnMaterialOpt") { newInstance(clsOpt) }
+    }
+
+    private fun stageA(act: Activity, cl: ClassLoader, bar: View, density: Float) {
+        log("=== 阶段 A：View.setHnMaterial 裸调 ===")
+        val material = buildMaterial(cl, bar.width, bar.height, 20f * density) ?: return
+        val clsMaterial = material.javaClass
+        val liquid = step("material.toLiquidGlassMaterial()") {
+            clsMaterial.getMethod("toLiquidGlassMaterial").invoke(material)
+        } ?: return
+        log("toLiquidGlassMaterial -> $liquid")
+        val opt = newOpt(cl) ?: return
+        val clsOpt = loadClass(cl, "com.hihonor.android.graphics.material.HnMaterialOpt") ?: return
+        val materialOpt = step("opt.getMaterialOpt()") {
+            clsOpt.getMethod("getMaterialOpt").invoke(opt)
+        } ?: return
+        val clsBaseMaterial = loadClass(cl, "android.graphics.material.Material") ?: return
+        val arr = ReflectArray.newInstance(clsBaseMaterial, 1)
+        ReflectArray.set(arr, 0, liquid)
+        step("view.setHnMaterial([liquid], opt)") {
+            val m = View::class.java.getMethod(
+                "setHnMaterial",
+                ReflectArray.newInstance(clsBaseMaterial, 0).javaClass,
+                materialOpt.javaClass
+            )
+            m.invoke(bar, arr, materialOpt)
+        }
+        step("view.setBlurEnableForView(true) via View") {
+            View::class.java.getMethod("setBlurEnableForView", Z).invoke(bar, true)
+        }
+        toast(act, "阶段A 已应用：View 液态材质")
+    }
+
+    private fun stageB(act: Activity, cl: ClassLoader, bar: View, density: Float) {
+        log("=== 阶段 B：HnMaterialManager.setHnMaterial(View,...) ===")
+        val material = buildMaterial(cl, bar.width, bar.height, 20f * density) ?: return
+        val opt = newOpt(cl) ?: return
+        val clsMgr = loadClass(cl, "com.hihonor.android.graphics.material.HnMaterialManager") ?: return
+        val clsMaterial = loadClass(cl, "com.hihonor.android.graphics.material.HnLiquidGlassMaterial") ?: return
+        val clsOpt = loadClass(cl, "com.hihonor.android.graphics.material.HnMaterialOpt") ?: return
+        step("HnMaterialManager.setHnMaterial(view, material, opt)") {
+            clsMgr.getMethod("setHnMaterial", View::class.java, clsMaterial, clsOpt)
+                .invoke(null, bar, material, opt)
+        }
+        toast(act, "阶段B 已应用：Manager 液态材质")
+    }
+
+    private fun stageC(act: Activity, cl: ClassLoader, bar: View, density: Float) {
+        log("=== 阶段 C：View.setHnMaterial + MaterialOpt 标志 ===")
+        val material = buildMaterial(cl, bar.width, bar.height, 20f * density) ?: return
+        val liquid = step("material.toLiquidGlassMaterial()") {
+            material.javaClass.getMethod("toLiquidGlassMaterial").invoke(material)
+        } ?: return
+        val opt = newOpt(cl) ?: return
+        val clsOpt = opt.javaClass
+        step("opt.setLayerBackdrop(true)") { clsOpt.getMethod("setLayerBackdrop", Z).invoke(opt, true) }
+        step("opt.setClearBackground(true)") { clsOpt.getMethod("setClearBackground", Z).invoke(opt, true) }
+        val materialOpt = step("opt.getMaterialOpt()") {
+            clsOpt.getMethod("getMaterialOpt").invoke(opt)
+        } ?: return
+        val clsBaseMaterial = loadClass(cl, "android.graphics.material.Material") ?: return
+        val arr = ReflectArray.newInstance(clsBaseMaterial, 1)
+        ReflectArray.set(arr, 0, liquid)
+        step("view.setHnMaterial([liquid], opt+flags)") {
+            val m = View::class.java.getMethod(
+                "setHnMaterial",
+                ReflectArray.newInstance(clsBaseMaterial, 0).javaClass,
+                materialOpt.javaClass
+            )
+            m.invoke(bar, arr, materialOpt)
+        }
+        toast(act, "阶段C 已应用：材质+backdrop 标志")
+    }
+
+    private fun stageD(act: Activity, cl: ClassLoader, bar: View) {
+        log("=== 阶段 D：HnBackgroundBlurDrawable 兜底磨砂 ===")
+        val clsD = loadClass(cl, "com.hihonor.android.graphics.drawable.HnBackgroundBlurDrawable") ?: return
+        val d = step("new HnBackgroundBlurDrawable") { newInstance(clsD) } ?: return
+        step("drawable.createBlurDrawable(bar)") {
+            clsD.getMethod("createBlurDrawable", View::class.java).invoke(d, bar)
+        }
+        step("drawable.setBlurRadius(150)") {
+            clsD.getMethod("setBlurRadius", Int::class.javaPrimitiveType).invoke(d, 150)
+        }
+        step("drawable.setSaturation(1.35)") { clsD.getMethod("setSaturation", F).invoke(d, 1.35f) }
+        step("drawable.setColor(0x40FFFFFF)") {
+            clsD.getMethod("setColor", Int::class.javaPrimitiveType).invoke(d, 0x40FFFFFF)
+        }
+        step("drawable.setBackgroundBlur(bar)") {
+            clsD.getMethod("setBackgroundBlur", View::class.java).invoke(d, bar)
+        }
+        toast(act, "阶段D 已应用：系统模糊背景")
+    }
+
+    // ---------------- 找底栏（与 v0.1 相同口径） ----------------
+
     private fun findBottomBar(decor: View, density: Float): View? {
         val minH = 36f * density
         val maxH = 110f * density
@@ -121,7 +240,6 @@ object GlassProbe {
                 val loc = IntArray(2)
                 v.getLocationInWindow(loc)
                 if (loc[1] + v.height >= decor.height - 2) {
-                    log("候选: ${v.javaClass.name} depth=$depth rect=[${loc[0]},${loc[1]} - ${loc[0] + v.width},${loc[1] + v.height}]")
                     if (depth > bestDepth) {
                         best = v
                         bestDepth = depth
@@ -137,74 +255,14 @@ object GlassProbe {
         return best
     }
 
-    /** 反射调用系统玻璃 API。返回最后一步 setWindowLiquidGlassEnable 是否未抛异常。 */
-    private fun runGlass(cl: ClassLoader, view: View, rect: RectF, radiusPx: Float): Boolean {
-        // ---- 加载类 ----
-        val clsMgr = loadClass(cl, "com.hihonor.android.graphics.HnLiquidGlassWindowManger") ?: return false
-        val clsMaterial = loadClass(cl, "com.hihonor.android.graphics.material.HnLiquidGlassMaterial") ?: return false
-        val clsBlur = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.BlurParamEx") ?: return false
-        val clsGlass = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.GlassParamEx") ?: return false
-        val clsShape = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.ShapeParamEx") ?: return false
-        val clsShapeEnum = loadClass(cl, "com.hihonor.android.graphics.material.atomiceffect.ShapeParamEx\$Shape") ?: return false
-        val clsSC = loadClass(cl, "android.view.SurfaceControl") ?: return false
-
-        // ---- 组装参数 ----
-        val blur = step("new BlurParamEx") { newInstance(clsBlur) } ?: return false
-        step("BlurParamEx.setRadius(48)") { clsBlur.getMethod("setRadius", F).invoke(blur, 48f) }
-        step("BlurParamEx.setScale(0.3)") { clsBlur.getMethod("setScale", F).invoke(blur, 0.3f) }
-        step("BlurParamEx.setSaturation(1.35)") { clsBlur.getMethod("setSaturation", F).invoke(blur, 1.35f) }
-
-        val glass = step("new GlassParamEx") { newInstance(clsGlass) } ?: return false
-        step("GlassParamEx.setRefraction(1.0)") { clsGlass.getMethod("setRefraction", F).invoke(glass, 1.0f) }
-        step("GlassParamEx.setThickness(1.4)") { clsGlass.getMethod("setThickness", F).invoke(glass, 1.4f) }
-        step("GlassParamEx.setDepth(0.5)") { clsGlass.getMethod("setDepth", F).invoke(glass, 0.5f) }
-        step("GlassParamEx.setDispersion(0.25)") { clsGlass.getMethod("setDispersion", F).invoke(glass, 0.25f) }
-
-        val shape = step("new ShapeParamEx(RRect)") {
-            val rrect = clsShapeEnum.enumConstants?.firstOrNull { it.toString() == "RRect" }
-                ?: throw IllegalStateException("Shape.RRect 不存在")
-            clsShape.getConstructor(clsShapeEnum).newInstance(rrect)
-        } ?: return false
-        step("ShapeParamEx.setRect($rect)") { clsShape.getMethod("setRect", RectF::class.java).invoke(shape, rect) }
-        step("ShapeParamEx.setRadius($radiusPx)") { clsShape.getMethod("setRadius", F).invoke(shape, radiusPx) }
-
-        val material = step("new HnLiquidGlassMaterial") { newInstance(clsMaterial) } ?: return false
-        step("material.setBlurParamEx") { clsMaterial.getMethod("setBlurParamEx", clsBlur).invoke(material, blur) }
-        step("material.setGlassParamEx") { clsMaterial.getMethod("setGlassParamEx", clsGlass).invoke(material, glass) }
-        step("material.setShapeParamEx") { clsMaterial.getMethod("setShapeParamEx", clsShape).invoke(material, shape) }
-
-        // ---- 调用窗口级 API ----
-        val mgr = step("new HnLiquidGlassWindowManger") { newInstance(clsMgr) } ?: return false
-        step("mgr.setBlurEnableForView(view, true)") {
-            clsMgr.getMethod("setBlurEnableForView", View::class.java, Z).invoke(mgr, view, true)
-        }
-        val sc = step("mgr.getSurfaceControl(view)") {
-            clsMgr.getMethod("getSurfaceControl", View::class.java).invoke(mgr, view)
-        } ?: return false
-        val valid = runCatching { clsSC.getMethod("isValid").invoke(sc) }.getOrNull()
-        log("SurfaceControl=$sc isValid=$valid")
-        step("mgr.setWindowBlurParams(sc, blur)") {
-            clsMgr.getMethod("setWindowBlurParams", clsSC, clsBlur).invoke(mgr, sc, blur)
-        }
-        val enableResult = step("mgr.setWindowLiquidGlassEnable(sc, true, material)") {
-            clsMgr.getMethod("setWindowLiquidGlassEnable", clsSC, Z, clsMaterial)
-                .invoke(mgr, sc, true, material)
-        }
-        return enableResult != STEP_FAILED
-    }
-
-    // ---------- 反射小工具 ----------
+    // ---------------- 反射小工具 ----------------
 
     private val F: Class<*> = Float::class.javaPrimitiveType!!
     private val Z: Class<*> = Boolean::class.javaPrimitiveType!!
 
-    private val STEP_FAILED = Any()
-
     private fun loadClass(cl: ClassLoader, name: String): Class<*>? {
         return try {
-            val c = Class.forName(name, false, cl)
-            log("loadClass OK: $name")
-            c
+            Class.forName(name, false, cl)
         } catch (t: Throwable) {
             log("loadClass FAIL: $name -> $t")
             null
@@ -214,7 +272,6 @@ object GlassProbe {
     private fun newInstance(clazz: Class<*>): Any =
         clazz.getDeclaredConstructor().apply { isAccessible = true }.newInstance()
 
-    /** 执行一步并记日志；失败返回 STEP_FAILED（与正常返回值 null 区分）。 */
     private fun step(name: String, block: () -> Any?): Any? {
         return try {
             val r = block()
@@ -223,8 +280,12 @@ object GlassProbe {
         } catch (t: Throwable) {
             val cause = if (t is InvocationTargetException) t.targetException ?: t else t
             log("STEP FAIL: $name -> $cause")
-            STEP_FAILED
+            null
         }
+    }
+
+    private fun toast(act: Activity, msg: String) {
+        runCatching { Toast.makeText(act, msg, Toast.LENGTH_SHORT).show() }
     }
 
     private fun log(msg: String, t: Throwable? = null) {
