@@ -64,22 +64,29 @@ object GlassProbe {
     private fun runStages(act: Activity) {
         val decor = act.window?.decorView ?: return
         val density = act.resources.displayMetrics.density
-        // 阶段 1：HnMaterialManager 官方入口（v0.2 的 B，已证可见效）
+        // 阶段 1：HnMaterialManager 官方入口
         applyToBar(act, density, "阶段1") { cl, bar ->
             stageB(act, cl, bar, density)
         }
-        // 阶段 2：裸调 View.setHnMaterial + MaterialOpt 标志（v0.2 的 C，已证可见效）
+        // 阶段 2：裸调 View.setHnMaterial + MaterialOpt 标志
         decor.postDelayed({
             applyToBar(act, density, "阶段2") { cl, bar ->
                 stageC(act, cl, bar, density)
             }
         }, 5000)
-        // 阶段 3：系统磨砂 Drawable 兜底（v0.2 的 D，已证可见效）
+        // 阶段 3：揭盖——清掉底栏子视图的背景（微信会给子 LinearLayout 铺不透明灰底，
+        // 可能盖住材质；LiquidTab 的微信适配就是这么揭的，微信下次布局会自己恢复）
         decor.postDelayed({
-            applyToBar(act, density, "阶段3") { cl, bar ->
-                stageD(act, cl, bar)
+            applyToBar(act, density, "阶段3") { _, bar ->
+                stageUnmask(act, bar)
             }
         }, 10000)
+        // 阶段 4：系统磨砂 Drawable 兜底对照
+        decor.postDelayed({
+            applyToBar(act, density, "阶段4") { cl, bar ->
+                stageD(act, cl, bar)
+            }
+        }, 15000)
     }
 
     /** 每个阶段都重新找一次底栏（几何会稳定下来），且校验命中的是真底栏。 */
@@ -237,8 +244,27 @@ object GlassProbe {
         toast(act, "阶段2 已应用：材质+backdrop 标志")
     }
 
+    private fun stageUnmask(act: Activity, bar: View) {
+        log("=== 阶段 3：清掉底栏子视图背景（揭盖） ===")
+        var cleared = 0
+        val stack = ArrayDeque<Pair<View, Int>>()
+        stack.addLast(bar to 0)
+        while (stack.isNotEmpty()) {
+            val (v, d) = stack.removeLast()
+            if (v !== bar && v.background != null) {
+                v.background = null
+                cleared++
+            }
+            if (v is ViewGroup && d < 6) {
+                for (i in 0 until v.childCount) stack.addLast(v.getChildAt(i) to d + 1)
+            }
+        }
+        log("共清掉 $cleared 个子视图背景")
+        toast(act, "阶段3 已揭盖：子视图背景已清")
+    }
+
     private fun stageD(act: Activity, cl: ClassLoader, bar: View) {
-        log("=== 阶段 3：HnBackgroundBlurDrawable 兜底磨砂 ===")
+        log("=== 阶段 4：HnBackgroundBlurDrawable 兜底磨砂 ===")
         val clsD = loadClass(cl, "com.hihonor.android.graphics.drawable.HnBackgroundBlurDrawable") ?: return
         val d = step("new HnBackgroundBlurDrawable") { newInstance(clsD) } ?: return
         step("drawable.createBlurDrawable(bar)") {
@@ -254,12 +280,36 @@ object GlassProbe {
         step("drawable.setBackgroundBlur(bar)") {
             clsD.getMethod("setBackgroundBlur", View::class.java).invoke(d, bar)
         }
-        toast(act, "阶段3 已应用：系统模糊背景")
+        toast(act, "阶段4 已应用：系统模糊背景")
     }
 
     // ---------------- 找底栏（与 v0.1 相同口径） ----------------
 
     private fun findBottomBar(decor: View, density: Float): View? {
+        // 首选：LiquidTab 微信适配器实证的真底栏类名，精确命中
+        val exact = findByClassName(decor, "com.tencent.mm.ui.LauncherUIBottomTabView")
+        if (exact != null) {
+            log("底栏精确命中: ${exact.javaClass.name} size=${exact.width}x${exact.height}")
+            return exact
+        }
+        log("未找到 LauncherUIBottomTabView，退回打分查找")
+        return findBottomBarScored(decor, density)
+    }
+
+    private fun findByClassName(root: View, className: String): View? {
+        val stack = ArrayDeque<View>()
+        stack.addLast(root)
+        while (stack.isNotEmpty()) {
+            val v = stack.removeLast()
+            if (v.javaClass.name == className && v.visibility == View.VISIBLE) return v
+            if (v is ViewGroup) {
+                for (i in v.childCount - 1 downTo 0) stack.addLast(v.getChildAt(i))
+            }
+        }
+        return null
+    }
+
+    private fun findBottomBarScored(decor: View, density: Float): View? {
         val minH = 30f * density
         val maxH = 120f * density
         val tabLabels = listOf("微信", "通讯录", "发现", "我")
