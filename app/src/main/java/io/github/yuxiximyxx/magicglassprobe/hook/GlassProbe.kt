@@ -92,7 +92,17 @@ object GlassProbe {
         val decor = act.window?.decorView ?: return
         val bar = findBottomBar(decor, density)
         if (bar == null) {
-            log("$label 未找到合格底栏候选，跳过")
+            log("$label 未找到合格底栏候选，2 秒后重试一次")
+            decor.postDelayed({
+                val retry = findBottomBar(decor, density)
+                if (retry == null) {
+                    log("$label 重试仍未找到底栏，跳过")
+                    toast(act, "$label 未找到底栏")
+                } else {
+                    runCatching { block(act.classLoader, retry) }
+                        .onFailure { log("$label 重试执行异常（已吞）", it) }
+                }
+            }, 2000)
             return
         }
         val idName = runCatching { act.resources.getResourceEntryName(bar.id) }.getOrNull()
@@ -250,25 +260,31 @@ object GlassProbe {
     // ---------------- 找底栏（与 v0.1 相同口径） ----------------
 
     private fun findBottomBar(decor: View, density: Float): View? {
-        val minH = 36f * density
-        val maxH = 110f * density
+        val minH = 30f * density
+        val maxH = 120f * density
+        val tabLabels = listOf("微信", "通讯录", "发现", "我")
         var best: View? = null
-        var bestDepth = -1
+        var bestScore = Int.MIN_VALUE
         val stack = ArrayDeque<Pair<View, Int>>()
         stack.addLast(decor to 0)
         while (stack.isNotEmpty()) {
             val (v, depth) = stack.removeLast()
             if (v.visibility == View.VISIBLE &&
                 v.width >= decor.width * 0.85 &&
-                v.height >= minH && v.height <= maxH &&
-                !insideScrollingContainer(v)
+                v.height >= minH && v.height <= maxH
             ) {
                 val loc = IntArray(2)
                 v.getLocationInWindow(loc)
-                if (loc[1] + v.height >= decor.height - 2) {
-                    if (depth > bestDepth) {
+                if (loc[1] + v.height >= decor.height - 4) {
+                    var score = depth
+                    val hits = countTabLabels(v, tabLabels)
+                    if (hits >= 3) score += 1000
+                    if (insideScrollingContainer(v)) score -= 500
+                    val idName = runCatching { decor.resources.getResourceEntryName(v.id) }.getOrNull()
+                    log("候选 ${v.javaClass.name} id=$idName rect=[${loc[0]},${loc[1]} ${v.width}x${v.height}] depth=$depth 标签命中=$hits score=$score")
+                    if (score > bestScore) {
                         best = v
-                        bestDepth = depth
+                        bestScore = score
                     }
                 }
             }
@@ -278,11 +294,33 @@ object GlassProbe {
                 }
             }
         }
+        if (best != null) log("底栏选定: ${best.javaClass.name} score=$bestScore")
         return best
     }
 
-    /** v0.2 教训：聊天列表 item 会垫在底栏下面且几何一模一样，命中它效果会被
-     *  RecyclerView 回收带到别的行上。底栏绝不会在滚动容器里面，先排除。 */
+    /** 数一下子树里有几个 TextView 的文本正好是主界面四个页签名。 */
+    private fun countTabLabels(root: View, labels: List<String>): Int {
+        var found = 0
+        val seen = HashSet<String>()
+        val stack = ArrayDeque<View>()
+        stack.addLast(root)
+        var guard = 0
+        while (stack.isNotEmpty() && guard < 400) {
+            val v = stack.removeLast()
+            guard++
+            if (v is android.widget.TextView) {
+                val t = v.text?.toString()
+                if (t != null && labels.contains(t) && seen.add(t)) found++
+            }
+            if (v is ViewGroup) {
+                for (i in 0 until v.childCount) stack.addLast(v.getChildAt(i))
+            }
+        }
+        return found
+    }
+
+    /** 聊天列表 item 会垫在底栏下面且几何一模一样；它在滚动容器里，
+     *  真底栏不在 —— 只作扣分项，不再一票否决（v0.3 就栽在硬排除上）。 */
     private fun insideScrollingContainer(v: View): Boolean {
         var p: View? = v.parent as? View
         while (p != null) {
